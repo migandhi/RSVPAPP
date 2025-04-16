@@ -9,7 +9,6 @@ if (!isset($_SESSION['is_admin']) || $_SESSION['is_admin'] !== true) {
 }
 
 // --- Database Connection ---
-// We need the connection early for fetching events
 require 'db_connect.php';
 
 // --- Configuration ---
@@ -22,7 +21,7 @@ $page_error_message = null; // To store general page errors (like DB connection)
 // --- Get Filter/Selection Values from URL (with defaults/sanitization) ---
 $search_term = trim($_GET['search_event'] ?? '');         // Event search string
 $selected_event_id_from_get = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT); // Event ID from URL
-$search_hof = trim($_GET['search_hof'] ?? '');            // HoF/ITS search string
+$search_hof = trim($_GET['search_hof'] ?? '');            // HoF/ITS search string (filters based on *current* HoF details)
 $filter_attendees_op = $_GET['filter_attendees_op'] ?? 'gte'; // Comparison operator (gte, lte, eq) - default to >=
 // Validate attendee count filter - must be non-negative integer or null if blank/invalid
 $filter_attendees_count_input = trim($_GET['filter_attendees_count'] ?? '');
@@ -32,12 +31,10 @@ if ($filter_attendees_count_input !== '') {
     if ($filtered_count !== false && $filtered_count >= 0) {
         $filter_attendees_count = $filtered_count;
     } else {
-         // Optionally set an error message if invalid input was given
-         // $page_error_message = "Invalid attendee count filter value provided.";
-         // For now, we just treat it as null/not applied if invalid
+         // Maybe set a warning, but treating as null is okay for filtering
     }
 }
-$current_page = filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT, ['options' => ['default' => 1, 'min_range' => 1]]); // Current page number
+$current_page = filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT, ['options' => ['default' => 1, 'min_range' => 1]]);
 
 // --- Event Handling: Fetch All Events & Determine Selected ---
 $all_events = [];
@@ -96,8 +93,9 @@ if ($selected_event_id !== null) {
     $paramTypes .= "i";
 }
 
-// Add HoF/ITS filter if provided
+// Add HoF/ITS filter if provided (searches *current* details via JOIN)
 if (!empty($search_hof)) {
+    // Note: Requires JOIN to heads_of_family (aliased as 'h')
     $whereClauses[] = "(h.name LIKE ? OR h.its_number LIKE ?)";
     $like_search_hof = "%" . $search_hof . "%";
     $params[] = $like_search_hof;
@@ -106,6 +104,7 @@ if (!empty($search_hof)) {
 }
 
 // Prepare HAVING clause for Attendee count filter (applies *after* GROUP BY)
+// Uses the actual aggregate function because alias isn't available in count subquery
 $havingClause = "";
 $havingParams = []; // Separate params for HAVING part of query
 $havingParamTypes = "";
@@ -113,10 +112,8 @@ if ($filter_attendees_count !== null) { // Only apply if count is valid non-nega
     $op = "=";
     if ($filter_attendees_op == 'gte') $op = ">=";
     if ($filter_attendees_op == 'lte') $op = "<=";
-    // --- CORRECTED LINE ---
-    // Use the aggregate function directly in the HAVING clause string
+    // Use the aggregate function directly here
     $havingClause = "HAVING SUM(r.attendee_count) " . $op . " ?";
-    // --- END CORRECTION ---
     $havingParams[] = $filter_attendees_count;
     $havingParamTypes .= "i";
 }
@@ -131,13 +128,17 @@ if (!empty($whereClauses)) {
 if ($selected_event_id !== null && $page_error_message === null) {
 
     // 1. Get Total Count of Families MATCHING FILTERS (for pagination)
+    // Note: JOIN is needed here *if* $search_hof filter is active
     $sqlCountFamilies = "SELECT COUNT(*) as total FROM (
-                            SELECT r.hof_id
-                            FROM rsvps r
-                            JOIN heads_of_family h ON r.hof_id = h.id
-                            {$whereSql}          -- Apply WHERE filters
-                            GROUP BY r.hof_id
-                            {$havingClause}       -- Apply HAVING filters
+                            SELECT r.hof_id -- Select distinct HoF ID
+                            FROM rsvps r ";
+    // Add JOIN only if HoF filter is present
+    if (!empty($search_hof)) {
+        $sqlCountFamilies .= " JOIN heads_of_family h ON r.hof_id = h.id ";
+    }
+    $sqlCountFamilies .= " {$whereSql}          -- Apply WHERE filters
+                            GROUP BY r.hof_id     -- Group by HoF
+                            {$havingClause}       -- Apply HAVING filters on attendee sum
                          ) AS filtered_families";
 
     $stmtCount = $conn->prepare($sqlCountFamilies);
@@ -152,26 +153,38 @@ if ($selected_event_id !== null && $page_error_message === null) {
                 $resultCount = $stmtCount->get_result();
                 if ($rowCount = $resultCount->fetch_assoc()) {
                     $total_families = (int)$rowCount['total'];
+                } else {
+                     // Handle case where query runs but returns no rows (e.g., fetch_assoc fails)
+                     $total_families = 0;
                 }
             } catch (Exception $e) {
                  $page_error_message = "Error executing family count query: " . htmlspecialchars($e->getMessage());
             }
         } else {
-             // Execute without params if no filters applied beyond event_id (which might be the only one if $params/$havingParams are empty)
-             // Note: Event ID is always present if we reach here, so $params is never truly empty. Binding logic is likely fine.
-             // Re-evaluating the need for parameterless execution. The existing logic should handle it.
+             // Execute without params if no filters applied (only event_id)
             try {
-                 $stmtCount->execute();
-                 $resultCount = $stmtCount->get_result();
-                 if ($rowCount = $resultCount->fetch_assoc()) {
-                     $total_families = (int)$rowCount['total'];
-                 }
+                 // Since event_id is always present, we should always have params.
+                 // This block might be redundant but kept for safety.
+                 // Re-evaluating: $params WILL contain event_id, so bind_param is always needed.
+                 // If bind_param somehow fails above, this block shouldn't execute.
+                 // Let's simplify: assume bind_param is always attempted if params exist.
+                 // $stmtCount->execute(); // Potentially problematic without bind_param if params exist
+                 // $resultCount = $stmtCount->get_result();
+                 // if ($rowCount = $resultCount->fetch_assoc()) {
+                 //     $total_families = (int)$rowCount['total'];
+                 // } else {
+                 //      $total_families = 0;
+                 // }
+                 // If we reach here without params, it likely means only event_id filter exists.
+                 // The bind_param logic should handle this. If not, there's a logic error above.
+                 // Let's rely on the bind_param path.
             } catch (Exception $e) {
+                 // Should not be reached if bind_param logic is correct.
                  $page_error_message = "Error executing parameterless family count query: " . htmlspecialchars($e->getMessage());
             }
         }
         $stmtCount->close();
-    } else {
+    } else { // Prepare failed
         $page_error_message = "Error preparing family count total query: " . htmlspecialchars($conn->error);
     }
 
@@ -179,6 +192,7 @@ if ($selected_event_id !== null && $page_error_message === null) {
     if ($total_families > 0 && $page_error_message === null) {
         $total_pages = ceil($total_families / $items_per_page);
         if ($current_page > $total_pages) $current_page = $total_pages; // Adjust page if out of bounds
+        if ($current_page < 1) $current_page = 1;
         $offset = ($current_page - 1) * $items_per_page;
     } else {
         $current_page = 1; // Reset if no families or error occurred
@@ -186,16 +200,25 @@ if ($selected_event_id !== null && $page_error_message === null) {
         $offset = 0;
     }
 
-    // 2. Get Paginated Family Counts MATCHING FILTERS for display (only if no prior errors)
+    // 2. Get Paginated Family Counts MATCHING FILTERS for display (only if no prior errors and families exist)
     if ($page_error_message === null && $total_families > 0) {
-        $sqlFamily = "SELECT h.its_number, h.name AS hof_name, SUM(r.attendee_count) as total_attendees
-                      FROM rsvps r
-                      JOIN heads_of_family h ON r.hof_id = h.id
-                      {$whereSql}          -- Apply WHERE filters
-                      GROUP BY r.hof_id
-                      {$havingClause}       -- Apply HAVING filters
-                      ORDER BY h.name       -- Order results
-                      LIMIT ? OFFSET ?";    
+        // Select the `_at_rsvp` fields for display
+        $sqlFamily = "SELECT
+                        r.hof_id, -- Keep for potential future use
+                        r.hof_name_at_rsvp AS hof_name,
+                        r.hof_its_at_rsvp AS its_number,
+                        r.hof_sabil_at_rsvp AS sabil_number,
+                        SUM(r.attendee_count) as total_attendees
+                      FROM rsvps r ";
+        // Add JOIN only if HoF filter is present (required for the filter)
+        if (!empty($search_hof)) {
+            $sqlFamily .= " JOIN heads_of_family h ON r.hof_id = h.id ";
+        }
+        $sqlFamily .= " {$whereSql}          -- Apply WHERE filters (might use h.name/h.its)
+                      GROUP BY r.hof_id, r.hof_name_at_rsvp, r.hof_its_at_rsvp, r.hof_sabil_at_rsvp -- Group by RSVP-time details
+                      {$havingClause}       -- Apply HAVING filters on attendee sum
+                      ORDER BY hof_name     -- Order results by the name stored at RSVP time
+                      LIMIT ? OFFSET ?";
 
         $stmtFamily = $conn->prepare($sqlFamily);
         if ($stmtFamily === false) {
@@ -224,7 +247,7 @@ if ($selected_event_id !== null && $page_error_message === null) {
             }
             $stmtFamily->close();
         }
-    }
+    } // end if $total_families > 0
 
     // 3. Get Overall Total Attendee Count for the selected event (UNFILTERED - for summary) (only if no prior error)
     if ($page_error_message === null) {
@@ -236,14 +259,16 @@ if ($selected_event_id !== null && $page_error_message === null) {
             $resultTotalOverall = $stmtTotalOverall->get_result();
             if ($rowTotalOverall = $resultTotalOverall->fetch_assoc()) {
                 $totalAttendees = $rowTotalOverall['total'] ?? 0; // Get overall total
+            } else {
+                $totalAttendees = 0; // Ensure it's 0 if query returns no rows
             }
             $stmtTotalOverall->close();
              // Calculate predicted count based on overall total
              if ($totalAttendees > 0) {
                  $predicted_thaal_count = ceil($totalAttendees / $members_per_thaal);
              }
-        } else {
-             $page_error_message = "Error preparing overall total attendee count: " . $conn->error;
+        } else { // Prepare failed
+             $page_error_message = "Error preparing overall total attendee count: " . htmlspecialchars($conn->error);
         }
     }
 
@@ -254,18 +279,40 @@ if ($selected_event_id !== null && $page_error_message === null) {
 // Check for export request *after* main data fetching logic so we have totals etc.
 // But execute *before* HTML output begins.
 if ($selected_event_id !== null && isset($_GET['export']) && $_GET['export'] == 'csv' && $page_error_message === null) {
-    // No need to reopen DB connection as we haven't closed it yet.
+    // No need to reopen DB connection if $conn is still valid.
+    // Reconnect if necessary (e.g., if closed previously, though it shouldn't be here)
+    if (!$conn || !$conn->ping()) {
+         require 'db_connect.php'; // Re-establish connection
+         if ($conn->connect_error) {
+              // Set error and prevent export if reconnect fails
+              $page_error_message = "Database connection error during export. Please try again.";
+              // Exit export attempt if connection failed
+              goto end_export_handling; // Jump past export logic
+         }
+    }
+
 
     $exportData = [];
     // Fetch ALL family counts MATCHING FILTERS (no pagination for export)
-    $sqlExport = "SELECT h.name AS hof_name, h.its_number, SUM(r.attendee_count) as attendee_count, e.event_name, MIN(r.rsvp_timestamp) as rsvp_timestamp
+    // Select `_at_rsvp` details for export
+    $sqlExport = "SELECT
+                    r.hof_name_at_rsvp AS hof_name,
+                    r.hof_its_at_rsvp AS its_number,
+                    r.hof_sabil_at_rsvp AS sabil_number,
+                    SUM(r.attendee_count) as attendee_count,
+                    e.event_name,
+                    MIN(r.rsvp_timestamp) as rsvp_timestamp
                   FROM rsvps r
-                  JOIN heads_of_family h ON r.hof_id = h.id
-                  JOIN events e ON r.event_id = e.id
-                  {$whereSql}          -- Apply WHERE filters from main page load
-                  GROUP BY r.hof_id, e.event_name, h.name, h.its_number -- Ensure proper grouping
+                  JOIN events e ON r.event_id = e.id ";
+     // Add JOIN only if HoF filter is present (required for the filter)
+     if (!empty($search_hof)) {
+        $sqlExport .= " JOIN heads_of_family h ON r.hof_id = h.id ";
+     }
+     $sqlExport .= " {$whereSql}          -- Apply WHERE filters (might use h.name/h.its)
+                  GROUP BY r.hof_id, e.event_name, r.hof_name_at_rsvp, r.hof_its_at_rsvp, r.hof_sabil_at_rsvp -- Group by RSVP-time details
                   {$havingClause}       -- Apply HAVING filter from main page load
-                  ORDER BY h.name";
+                  ORDER BY hof_name";    // Order by RSVP-time name
+
     $stmtExport = $conn->prepare($sqlExport);
 
     if($stmtExport) {
@@ -273,8 +320,9 @@ if ($selected_event_id !== null && isset($_GET['export']) && $_GET['export'] == 
         $exportParams = array_merge($params, $havingParams);
         $exportParamTypes = $paramTypes . $havingParamTypes;
         $exportSuccess = false; // Flag for successful export execution
+
         if (!empty($exportParamTypes)) {
-            try {
+             try {
                  $stmtExport->bind_param($exportParamTypes, ...$exportParams);
                  $stmtExport->execute();
                  $resultExport = $stmtExport->get_result();
@@ -283,21 +331,23 @@ if ($selected_event_id !== null && isset($_GET['export']) && $_GET['export'] == 
                  }
                  $exportSuccess = true;
              } catch (Exception $e) {
-                  // Don't die, maybe log and prevent download?
-                  error_log("Error executing export query: " . $e->getMessage());
+                  error_log("Error executing export query with params: " . $e->getMessage());
              }
         } else {
-             // Execute without params if no filters applied beyond event_id
-             try {
-                  $stmtExport->execute();
-                  $resultExport = $stmtExport->get_result();
-                  while ($row = $resultExport->fetch_assoc()) {
-                      $exportData[] = $row;
-                  }
-                  $exportSuccess = true;
-             } catch (Exception $e) {
-                  error_log("Error executing parameterless export query: " . $e->getMessage());
-             }
+             // Execute without params if no filters applied beyond event_id (should always have event_id param)
+             // Let's assume the bind_param path handles the case with only event_id correctly.
+             // If $exportParamTypes is truly empty, it implies no event_id filter, which shouldn't happen here.
+             // This block might indicate a logic error if reached.
+             // try {
+             //      $stmtExport->execute();
+             //      $resultExport = $stmtExport->get_result();
+             //      while ($row = $resultExport->fetch_assoc()) {
+             //          $exportData[] = $row;
+             //      }
+             //      $exportSuccess = true;
+             // } catch (Exception $e) {
+             //      error_log("Error executing parameterless export query: " . $e->getMessage());
+             // }
         }
         $stmtExport->close();
 
@@ -311,14 +361,15 @@ if ($selected_event_id !== null && isset($_GET['export']) && $_GET['export'] == 
             header('Content-Disposition: attachment; filename="' . $filename . '"');
             $output = fopen('php://output', 'w');
 
-            // Header Row
-            fputcsv($output, ['Head of Family', 'ITS Number', 'Count of Attendees', 'Event Name', 'First RSVP Date']);
+            // Header Row - Added Sabil Number
+            fputcsv($output, ['Head of Family (at RSVP)', 'ITS Number (at RSVP)', 'Sabil Number (at RSVP)', 'Count of Attendees', 'Event Name', 'First RSVP Date']);
 
             // Data Rows
             foreach ($exportData as $row) {
                 fputcsv($output, [
                     $row['hof_name'],
                     $row['its_number'],
+                    $row['sabil_number'] ?? '', // Handle potential NULL
                     $row['attendee_count'],
                     $row['event_name'],
                     date('Y-m-d H:i:s', strtotime($row['rsvp_timestamp']))
@@ -326,31 +377,36 @@ if ($selected_event_id !== null && isset($_GET['export']) && $_GET['export'] == 
             }
 
             // Summary Rows
-            fputcsv($output, []);
+            fputcsv($output, []); // Blank row
             fputcsv($output, ['Filters Applied to This Export']);
             fputcsv($output, ['Event:', $selected_event_name]);
-            if (!empty($search_hof)) fputcsv($output, ['HoF/ITS Search:', $search_hof]);
+            if (!empty($search_hof)) fputcsv($output, ['Current HoF/ITS Search:', $search_hof]); // Clarify it searches current details
             if ($filter_attendees_count !== null) fputcsv($output, ['Attendee Filter:', $filter_attendees_op . ' ' . $filter_attendees_count]);
-            fputcsv($output, []);
-            fputcsv($output, ['Overall Event Summary']);
+            fputcsv($output, []); // Blank row
+            fputcsv($output, ['Overall Event Summary (Unfiltered)']);
             fputcsv($output, ['Actual Thaal Count:', isset($actual_thaal_count) ? $actual_thaal_count : 'Not Set']);
-            fputcsv($output, ['Total Attendees (RSVPd - Unfiltered):', $totalAttendees]);
-            fputcsv($output, ['Predicted Thaal Count (Based on Unfiltered RSVPs):', $predicted_thaal_count]);
+            fputcsv($output, ['Total Attendees RSVPd:', $totalAttendees]);
+            fputcsv($output, ['Predicted Thaal Count (Based on RSVPs):', $predicted_thaal_count]);
             fputcsv($output, ['Members Per Thaal Used for Prediction:', $members_per_thaal]);
 
             fclose($output);
-            $conn->close(); // Close connection here after successful export
+            if ($conn && $conn->ping()) { // Close connection if still open
+               $conn->close();
+            }
             exit; // IMPORTANT: Stop script execution after sending CSV file
         } else {
              // Set page error if export query failed
              $page_error_message = "Error preparing data for export. Please try again.";
         }
 
-    } else {
+    } else { // Prepare failed
          // Handle prepare error for export query
          $page_error_message = "Error preparing database query for export: " . htmlspecialchars($conn->error);
     }
 }
+// Label for goto jump target
+end_export_handling:
+
 // --- End CSV Export Handling ---
 
 
@@ -365,9 +421,6 @@ if ($conn && $conn->ping()) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin - Enhanced RSVP Reports</title>
-    
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-
     <link rel="stylesheet" href="style.css"> <!-- Your base styles -->
     <style>
          /* General Styles */
@@ -379,7 +432,7 @@ if ($conn && $conn->ping()) {
          h1 { font-size: 2em;} h2 { font-size: 1.6em;} h3 { font-size: 1.3em;}
 
          /* Admin Nav */
-         .admin-nav { background-color: #ffffff; padding: 12px 25px; margin-bottom: 30px; border-radius: 5px; text-align: right; border: 1px solid #dee2e6; box-shadow: 0 1px 4px rgba(0,0,0,0.06); display: flex; justify-content: flex-end; align-items: center;}
+         .admin-nav { background-color: #ffffff; padding: 12px 25px; margin-bottom: 30px; border-radius: 0; /* Full width */ text-align: right; border-bottom: 1px solid #dee2e6; box-shadow: 0 1px 4px rgba(0,0,0,0.06); display: flex; justify-content: flex-end; align-items: center;}
          .admin-nav span { margin-right: auto; font-weight: bold; color: #495057; font-size: 1.1em;}
          .admin-nav a { margin-left: 20px; font-weight: 500; color: #0d6efd;}
 
@@ -445,18 +498,21 @@ if ($conn && $conn->ping()) {
          /* Table Styles */
          .table-container { overflow-x: auto; background-color: white; border-radius: 5px; border: 1px solid #dee2e6; box-shadow: 0 1px 4px rgba(0,0,0,0.06); margin-top: 10px;}
          table { width: 100%; border-collapse: collapse; margin-bottom: 0; }
-         th, td { border: none; border-bottom: 1px solid #dee2e6; padding: 12px 15px; text-align: left; vertical-align: middle; font-size: 0.95em;}
+         th, td { border: none; border-bottom: 1px solid #dee2e6; padding: 12px 15px; text-align: left; vertical-align: middle; font-size: 0.95em; }
          th { background-color: #f8f9fa; font-weight: 600; position: sticky; top: 0; z-index: 1;}
          tbody tr:last-child td { border-bottom: none; }
          tbody tr:nth-child(odd) { background-color: #f8f9fa; }
          tbody tr:hover { background-color: #e9ecef; }
 
          /* Pagination */
-         .pagination { text-align: center; margin: 35px 0; }
-         .pagination a, .pagination span { display: inline-block; padding: 8px 14px; margin: 0 4px; border: 1px solid #dee2e6; border-radius: 4px; color: #0d6efd; text-decoration: none; background-color: white; font-size: 0.9em;}
+         .pagination-container { display: flex; justify-content: space-between; align-items: center; margin: 30px 0 10px 0; padding: 0 5px; }
+         .pagination-info { color: #6c757d; font-size: 0.9em; }
+         .pagination { text-align: right; margin: 0; padding: 0; }
+         .pagination a, .pagination span { display: inline-block; padding: 8px 14px; margin-left: 5px; border: 1px solid #dee2e6; border-radius: 4px; color: #0d6efd; text-decoration: none; background-color: white; font-size: 0.9em;}
          .pagination a:hover { background-color: #e9ecef; border-color: #ced4da;}
          .pagination span.current-page { background-color: #0d6efd; color: white; border-color: #0d6efd; font-weight: bold;}
          .pagination span.disabled { color: #6c757d; border-color: #dee2e6; background-color: #f8f9fa; cursor: default;}
+         .pagination span.ellipsis { border: none; background: none; color: #6c757d; padding: 8px 5px;}
 
          /* Helper Classes */
          .error-message { background-color: #f8d7da; color: #842029; border: 1px solid #f5c2c7; padding: 12px 15px; border-radius: 4px; margin-bottom: 20px; }
@@ -477,7 +533,7 @@ if ($conn && $conn->ping()) {
 
      <!-- Display Page Level Errors -->
      <?php if ($page_error_message !== null): ?>
-         <div class="error-message"><?php echo $page_error_message; ?></div>
+         <div class="error-message"><?php echo htmlspecialchars($page_error_message); ?></div>
      <?php endif; ?>
 
 
@@ -507,6 +563,8 @@ if ($conn && $conn->ping()) {
                                         </span>
                                     </li>
                                 <?php endforeach; ?>
+                                 <!-- Add a placeholder for no results -->
+                                 <li class="no-results" style="display: none;">No events match your search.</li>
                             <?php endif; ?>
                          </ul>
                      </div>
@@ -514,7 +572,7 @@ if ($conn && $conn->ping()) {
 
                 <!-- HoF/ITS Filter -->
                 <div class="filter-group">
-                    <label for="search_hof">HoF/ITS:</label>
+                    <label for="search_hof">HoF/ITS (Current):</label> <!-- Clarify it searches current -->
                     <input type="search" id="search_hof" name="search_hof" placeholder="Name or ITS Number..." value="<?php echo htmlspecialchars($search_hof); ?>">
                 </div>
 
@@ -539,12 +597,12 @@ if ($conn && $conn->ping()) {
 
     <h2 class="report-title">Report for: <span id="current_event_name_display"><?php echo htmlspecialchars($selected_event_name); ?></span></h2>
 
-    <?php if ($selected_event_id === null): ?>
+    <?php if ($selected_event_id === null && $page_error_message === null): // Only show if no event selected AND no other error ?>
         <p class="no-results-message">Please select a valid event using the search above to view the report.</p>
     <?php elseif($page_error_message !== null): ?>
         <!-- Error message already shown at the top -->
          <p class="no-results-message">Could not load report data due to an error.</p>
-    <?php else: ?>
+    <?php else: // Event selected and no page error, proceed with report display ?>
 
         <!-- Prominent Total Count Display (Overall Event) -->
         <div class="total-count-display">
@@ -584,15 +642,18 @@ if ($conn && $conn->ping()) {
         <!-- Paginated Family List -->
         <h3>
             Filtered Family List
-            (<?php echo number_format($total_families); ?> families match<?php echo (!empty($search_hof) || $filter_attendees_count !== null) ? 'ing filters' : ''; ?> - Page <?php echo $current_page; ?> of <?php echo $total_pages; ?>)
+            <?php if ($page_error_message === null) : ?>
+                (<?php echo number_format($total_families); ?> families match<?php echo (!empty($search_hof) || $filter_attendees_count !== null) ? 'ing filters' : ''; ?>)
+            <?php endif; ?>
         </h3>
         <?php if (!empty($familyCounts)): ?>
              <div class="table-container">
                 <table>
                     <thead>
                         <tr>
-                            <th>Head of Family Name</th>
-                            <th>ITS Number</th>
+                            <th>Head of Family (at RSVP)</th>
+                            <th>ITS Number (at RSVP)</th>
+                            <th>Sabil Number (at RSVP)</th>
                             <th>Attendees Confirmed</th>
                         </tr>
                     </thead>
@@ -601,6 +662,7 @@ if ($conn && $conn->ping()) {
                         <tr>
                             <td><?php echo htmlspecialchars($family['hof_name']); ?></td>
                             <td><?php echo htmlspecialchars($family['its_number']); ?></td>
+                            <td><?php echo htmlspecialchars($family['sabil_number'] ?? '-'); // Display sabil ?></td>
                             <td><?php echo number_format($family['total_attendees']); ?></td>
                         </tr>
                         <?php endforeach; ?>
@@ -610,48 +672,72 @@ if ($conn && $conn->ping()) {
 
             <!-- Pagination Controls -->
             <?php if ($total_pages > 1): ?>
-                <div class="pagination">
-                    <?php // Build base query string for pagination links
-                        $base_query_params = [
-                            'event_id' => $selected_event_id,
-                            'search_event' => $search_term,
-                            'search_hof' => $search_hof,
-                            'filter_attendees_op' => $filter_attendees_op,
-                            'filter_attendees_count' => $filter_attendees_count ?? ''
-                        ];
-                    ?>
-                    <?php // Previous Page Link ?>
-                    <?php if ($current_page > 1): ?>
-                        <a href="?<?php echo http_build_query(array_merge($base_query_params, ['page' => $current_page - 1])); ?>">« Prev</a>
-                    <?php else: ?>
-                        <span class="disabled">« Prev</span>
-                    <?php endif; ?>
-
-                    <?php // Page Number Links (Simplified: show all - consider adding ellipsis logic for very high page counts if needed) ?>
-                    <?php for ($i = 1; $i <= $total_pages; $i++): ?>
-                        <?php if ($i == $current_page): ?>
-                            <span class="current-page"><?php echo $i; ?></span>
+                <div class="pagination-container">
+                    <div class="pagination-info">
+                         Showing <?php echo $offset + 1; ?> - <?php echo min($offset + $items_per_page, $total_families); ?> of <?php echo number_format($total_families); ?> results
+                    </div>
+                    <div class="pagination">
+                        <?php // Build base query string for pagination links
+                            $page_base_query_params = [
+                                'event_id' => $selected_event_id,
+                                'search_event' => $search_term,
+                                'search_hof' => $search_hof,
+                                'filter_attendees_op' => $filter_attendees_op,
+                                'filter_attendees_count' => $filter_attendees_count ?? ''
+                            ];
+                            $page_base_query_params = array_filter($page_base_query_params, function($v){ return $v !== '' && $v !== null;});
+                        ?>
+                        <?php // Previous Page Link ?>
+                        <?php if ($current_page > 1): ?>
+                            <a href="?<?php echo http_build_query(array_merge($page_base_query_params, ['page' => $current_page - 1])); ?>">« Prev</a>
                         <?php else: ?>
-                            <a href="?<?php echo http_build_query(array_merge($base_query_params, ['page' => $i])); ?>"><?php echo $i; ?></a>
+                            <span class="disabled">« Prev</span>
                         <?php endif; ?>
-                    <?php endfor; ?>
 
-                    <?php // Next Page Link ?>
-                    <?php if ($current_page < $total_pages): ?>
-                        <a href="?<?php echo http_build_query(array_merge($base_query_params, ['page' => $current_page + 1])); ?>">Next »</a>
-                    <?php else: ?>
-                        <span class="disabled">Next »</span>
-                    <?php endif; ?>
-                </div>
+                        <?php // Page Number Links (with ellipsis)
+                            $link_count = 0;
+                            for ($i = 1; $i <= $total_pages; $i++):
+                                 $showPage = false;
+                                 if ($total_pages <= 7 || $i == 1 || $i == $total_pages || ($i >= $current_page - 2 && $i <= $current_page + 2)) {
+                                     $showPage = true;
+                                 }
+                                 // Ellipsis before
+                                 if (!$showPage && $i > 1 && $i == $current_page - 3 && $total_pages > 7) {
+                                     echo '<span class="ellipsis">...</span>';
+                                 }
+                                 // Show link
+                                 if ($showPage) {
+                                     $link_count++;
+                                     if ($i == $current_page): ?>
+                                         <span class="current-page"><?php echo $i; ?></span>
+                                     <?php else: ?>
+                                         <a href="?<?php echo http_build_query(array_merge($page_base_query_params, ['page' => $i])); ?>"><?php echo $i; ?></a>
+                                     <?php endif;
+                                 }
+                                 // Ellipsis after
+                                 if (!$showPage && $i < $total_pages && $i == $current_page + 3 && $total_pages > 7) {
+                                      echo '<span class="ellipsis">...</span>';
+                                 }
+                            endfor;
+                        ?>
+
+                        <?php // Next Page Link ?>
+                        <?php if ($current_page < $total_pages): ?>
+                            <a href="?<?php echo http_build_query(array_merge($page_base_query_params, ['page' => $current_page + 1])); ?>">Next »</a>
+                        <?php else: ?>
+                            <span class="disabled">Next »</span>
+                        <?php endif; ?>
+                    </div>
+                 </div>
              <?php endif; // end if total_pages > 1 ?>
 
-        <?php else: ?>
+        <?php elseif ($page_error_message === null): // Show only if no families AND no general error ?>
              <p class="no-results-message">
-                <?php echo ($total_families > 0) ? 'Error loading data for this page.' : 'No RSVPs match the current filters for this event.'; ?>
+                <?php echo ($total_families == 0 && (!empty($search_hof) || $filter_attendees_count !== null)) ? 'No RSVPs match the current filters for this event.' : 'No RSVPs found for this event yet.'; ?>
              </p>
         <?php endif; ?>
 
-    <?php endif; // End check for selected event ?>
+    <?php endif; // End check for selected event & no page error ?>
 
 </div> <!-- end .container -->
 
@@ -660,8 +746,9 @@ if ($conn && $conn->ping()) {
     const searchInput = document.getElementById('search_event_input');
     const eventList = document.getElementById('event_list_ul');
     const eventListItems = eventList.querySelectorAll('li[data-id]'); // Select only items with data-id
+    const noResultsLi = eventList.querySelector('.no-results');
     const hiddenEventIdInput = document.getElementById('selected_event_id_hidden');
-    const reportFilterForm = document.getElementById('report-filter-form'); // Use the correct form ID
+    const reportFilterForm = document.getElementById('report-filter-form');
     const currentEventNameDisplay = document.getElementById('current_event_name_display');
 
     // Function to filter the list based on search input
@@ -678,77 +765,53 @@ if ($conn && $conn->ping()) {
                 item.style.display = 'none'; // Hide item
             }
         });
-         // Handle 'no results' message
-         const noResultsLi = eventList.querySelector('.no-results');
-         if (!hasVisibleItems && !noResultsLi) {
-            const li = document.createElement('li');
-            li.textContent = 'No events match your search.';
-            li.style.cursor = 'default';
-            li.classList.add('no-results');
-            eventList.appendChild(li);
-         } else if (hasVisibleItems && noResultsLi) {
-             noResultsLi.remove();
+         // Handle 'no results' message visibility
+         if(noResultsLi) {
+            noResultsLi.style.display = hasVisibleItems ? 'none' : '';
          }
     }
 
-     // Function to clear 'no results' message
-     function clearNoResults() {
-         const noResultsLi = eventList.querySelector('.no-results');
-          if (noResultsLi) {
-             noResultsLi.remove();
-          }
-     }
-
     // Event listeners for the search input
     searchInput.addEventListener('focus', () => {
-        clearNoResults();
         eventList.style.display = 'block';
-        filterEvents();
+        filterEvents(); // Filter immediately on focus
     });
     searchInput.addEventListener('blur', () => {
-        setTimeout(() => { eventList.style.display = 'none'; }, 200); // Delay allows click
+        // Delay hiding to allow click event on list item to register
+        setTimeout(() => { eventList.style.display = 'none'; }, 200);
     });
-    searchInput.addEventListener('input', () => {
-        clearNoResults();
-        filterEvents();
-    });
+    searchInput.addEventListener('input', filterEvents); // Filter as user types
 
     // Handle clicks on list items to select an event and submit form
     eventList.addEventListener('click', (e) => {
         let targetLi = e.target;
+        // Traverse up to find the LI element if user clicked on inner span
         while (targetLi && targetLi.tagName !== 'LI') { targetLi = targetLi.parentElement; }
 
-        if (targetLi && targetLi.tagName === 'LI' && targetLi.dataset.id) {
+        if (targetLi && targetLi.tagName === 'LI' && targetLi.dataset.id) { // Ensure it's a valid item li
             const selectedId = targetLi.dataset.id;
             const selectedName = targetLi.dataset.name;
 
             hiddenEventIdInput.value = selectedId;       // Update hidden ID field
-            searchInput.value = selectedName;            // Update visible search box text
-            currentEventNameDisplay.textContent = selectedName; // Update H2 title display
+            searchInput.value = selectedName;            // Update visible search box text (optional, could leave search term)
+            // No need to update H2 here, the page reload will handle it
             eventList.style.display = 'none';            // Hide the dropdown list
 
-            // Reset page number to 1 when selecting a new event
-            const pageInput = reportFilterForm.querySelector('input[name="page"]');
+            // Reset page number to 1 when selecting a new event via the dropdown
+             const pageInput = reportFilterForm.querySelector('input[name="page"]');
              if(pageInput) {
                  pageInput.value = '1';
              } else {
-                 // If page input doesn't exist (e.g., first load), create it
-                 const newPageInput = document.createElement('input');
-                 newPageInput.type = 'hidden'; newPageInput.name = 'page'; newPageInput.value = '1';
-                 reportFilterForm.appendChild(newPageInput);
+                 // If page input doesn't exist (e.g., first load), it will default to 1 anyway
              }
 
-            // Clear other filters (optional - uncomment if desired)
-            // document.getElementById('search_hof').value = '';
-            // document.getElementById('filter_attendees_count').value = '';
-            // document.getElementById('filter_attendees_op').value = 'gte'; // Reset operator
-
             // Submit the form to load the report for the newly selected event
+            // This effectively applies the selected event_id filter
             reportFilterForm.submit();
         }
     });
 
-     // Initial filter on page load if search term exists (useful if page reloads with search term)
+     // Initial filter on page load if search term exists
      if (searchInput.value) { filterEvents(); }
 
 </script>
